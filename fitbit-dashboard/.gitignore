@@ -1,0 +1,6 @@
+# Personal health exports must never be committed.
+*.zip
+*.json
+*.csv
+Takeout/
+Fitbit/
