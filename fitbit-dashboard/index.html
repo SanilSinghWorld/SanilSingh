@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>My Health Dashboard</title>
+<meta name="robots" content="noindex">
 <meta name="description" content="Private Fitbit dashboard. Reads a Google Takeout export in the browser; nothing is uploaded.">
 <style>
   :root {
@@ -85,6 +86,13 @@
   .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .btn input { display: none; }
   #status { min-height: 1.5em; }
+  .btn:disabled { opacity: 0.6; cursor: progress; }
+  .settings-body { display: grid; gap: 10px; margin-top: 10px; }
+  .field { display: grid; gap: 4px; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+  .field input {
+    font: inherit; font-size: 14px; font-weight: 400; color: var(--text-primary);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; width: 100%;
+  }
 
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin: 24px 0 12px; }
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
@@ -123,12 +131,13 @@
 <main>
   <header>
     <h1>My Health Dashboard</h1>
-    <p class="sub">Your Fitbit Inspire 3 data, read from your Google Takeout export. Everything runs in this browser tab. Nothing is uploaded.</p>
+    <p class="sub">Your Fitbit Inspire 3 data, synced from Google or read from a Takeout export. It goes straight from Google to this browser. There's no server in between.</p>
   </header>
 
   <section class="card loader" aria-label="Load data">
     <div class="loader-row">
-      <label class="btn primary">Open Takeout .zip or files
+      <button class="btn primary" id="syncBtn" type="button">Sync from Fitbit</button>
+      <label class="btn">Open Takeout .zip or files
         <input id="fileInput" type="file" multiple accept=".zip,.json,.csv,application/zip,application/json,text/csv">
       </label>
       <label class="btn" id="folderBtn">Open unzipped folder
@@ -136,7 +145,20 @@
       </label>
       <button class="btn" id="demoBtn" type="button">Try with demo data</button>
     </div>
-    <p id="status" class="muted" role="status" aria-live="polite">No data loaded yet. Takeout often splits big exports into several .zip files. Select all of them together.</p>
+    <p id="status" class="muted" role="status" aria-live="polite">No data yet. Tap Sync from Fitbit, or open a Takeout export for your full history (select every .zip part together).</p>
+    <details id="settings">
+      <summary>Sync settings</summary>
+      <div class="settings-body">
+        <label class="field">Google OAuth Client ID
+          <input id="clientId" type="text" autocomplete="off" spellcheck="false" placeholder="1234…apps.googleusercontent.com">
+        </label>
+        <div class="loader-row">
+          <button class="btn" id="saveClientId" type="button">Save</button>
+          <button class="btn" id="forgetBtn" type="button">Forget my data on this device</button>
+        </div>
+        <p class="muted">Synced and imported data is saved in this browser so it's there next time. The sign-in is kept in memory only and lasts about an hour. The README has the one-time Google Cloud setup.</p>
+      </div>
+    </details>
   </section>
 
   <div id="demoBanner" class="banner hidden">Showing generated demo data, not yours. Load your Takeout export to see your own numbers.</div>
@@ -242,7 +264,7 @@ const num = v => {
 };
 
 function newStore() {
-  return { days: new Map(), counts: {}, unknown: [], skipped: 0 };
+  return { days: new Map(), counts: {}, unknown: [], skipped: 0, lastSyncDate: null, lastSyncAt: null };
 }
 function day(store, date) {
   let d = store.days.get(date);
@@ -371,6 +393,216 @@ function demoStore() {
   return store;
 }
 
+// ---------- Saved data (this browser only) ----------
+
+const SAVE_KEY = "healthDays.v1";
+function saveStore() {
+  if (IS_DEMO || !STORE) return;
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify({
+      days: Object.fromEntries(STORE.days), counts: STORE.counts,
+      lastSyncDate: STORE.lastSyncDate, lastSyncAt: STORE.lastSyncAt,
+    }));
+  } catch (e) { console.warn("Couldn't save data in this browser", e); }
+}
+function loadSaved() {
+  try {
+    const o = JSON.parse(localStorage.getItem(SAVE_KEY));
+    if (!o?.days) return null;
+    const s = newStore();
+    s.days = new Map(Object.entries(o.days));
+    Object.assign(s, { counts: o.counts ?? {}, lastSyncDate: o.lastSyncDate ?? null, lastSyncAt: o.lastSyncAt ?? null });
+    return s;
+  } catch (e) { return null; }
+}
+
+let CLIENT_ID = "";
+function getClientId() { try { return localStorage.getItem("googleClientId") ?? CLIENT_ID; } catch (e) { return CLIENT_ID; } }
+function setClientId(v) { CLIENT_ID = v; try { localStorage.setItem("googleClientId", v); } catch (e) { /* memory only */ } }
+
+// ---------- Sync (Google Health API) ----------
+
+const API = "https://health.googleapis.com/v4/users/me/dataTypes/";
+const SCOPES = ["activity_and_fitness", "health_metrics_and_measurements", "sleep"]
+  .map(s => `https://www.googleapis.com/auth/googlehealth.${s}.readonly`);
+let tokenClient = null, token = null, pendingSync = false, syncing = false;
+
+function loadGis() {
+  return new Promise((resolve, reject) => {
+    if (window.google?.accounts?.oauth2) return resolve();
+    const el = document.createElement("script");
+    el.src = "https://accounts.google.com/gsi/client";
+    el.onload = resolve;
+    el.onerror = () => reject(new Error("Couldn't load Google sign-in. Check your connection."));
+    document.head.append(el);
+  });
+}
+
+function initTokenClient() {
+  if (!getClientId() || !window.google?.accounts?.oauth2) return;
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: getClientId(),
+    scope: SCOPES.join(" "),
+    callback: r => {
+      const go = pendingSync; pendingSync = false;
+      if (r.error) return setStatus(`Google sign-in failed: ${r.error_description || r.error}`);
+      token = { value: r.access_token, exp: Date.now() + (Number(r.expires_in) - 60) * 1000 };
+      if (go) runSync();
+    },
+    error_callback: e => {
+      pendingSync = false;
+      setStatus(e.type === "popup_closed" ? "Sign-in window was closed." : `Google sign-in didn't open (${e.type}). Allow pop-ups for this page and try again.`);
+    },
+  });
+}
+
+function onSyncClick() {
+  if (!getClientId()) {
+    $("settings").open = true;
+    setStatus("Add your Google OAuth Client ID under Sync settings first (one-time setup, see README).");
+    return;
+  }
+  if (token && token.exp > Date.now()) return runSync();
+  if (!tokenClient) {
+    setStatus("Google sign-in is still loading. Tap Sync again in a moment.");
+    loadGis().then(initTokenClient).catch(e => setStatus(e.message));
+    return;
+  }
+  pendingSync = true;
+  tokenClient.requestAccessToken({ prompt: "" });
+}
+
+async function api(path, init = {}) {
+  const res = await fetch(API + path, {
+    ...init,
+    headers: { Authorization: `Bearer ${token.value}`, ...(init.body ? { "Content-Type": "application/json" } : {}) },
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { msg = (await res.json()).error?.message || msg; } catch (e) { /* not JSON */ }
+    const err = new Error(msg); err.status = res.status; throw err;
+  }
+  return res.json();
+}
+
+const civil = iso => { const [year, month, d] = iso.split("-").map(Number); return { date: { year, month, day: d } }; };
+const civilIso = d => d ? `${d.year}-${pad(d.month)}-${pad(d.day)}` : null;
+function setField(date, key, v) { if (date && v != null) day(STORE, date)[key] = v; }
+
+// dailyRollUp ranges are capped per type (90 days, 14 for active minutes), so chunk them.
+async function dailyRollUp(type, start, endExcl, capDays) {
+  const out = [];
+  for (let s = start; s < endExcl; s = addDays(s, capDays)) {
+    const e = addDays(s, capDays) < endExcl ? addDays(s, capDays) : endExcl;
+    let pageToken = "";
+    do {
+      const res = await api(`${type}/dataPoints:dailyRollUp`, {
+        method: "POST",
+        body: JSON.stringify({ range: { start: civil(s), end: civil(e) }, windowSizeDays: 1, ...(pageToken && { pageToken }) }),
+      });
+      out.push(...(res.rollupDataPoints ?? []));
+      pageToken = res.nextPageToken ?? "";
+    } while (pageToken);
+  }
+  return out;
+}
+
+async function listPoints(type, filter, pageSize) {
+  const out = [];
+  let pageToken = "";
+  do {
+    const q = new URLSearchParams({ filter, pageSize });
+    if (pageToken) q.set("pageToken", pageToken);
+    const res = await api(`${type}/dataPoints?${q}`);
+    out.push(...(res.dataPoints ?? []));
+    pageToken = res.nextPageToken ?? "";
+  } while (pageToken);
+  return out;
+}
+
+// Daily summary types: one point per day with a civil `date`.
+const dailyJob = (type, key, read) => async (start, end) => {
+  const f = type.replace(/-/g, "_");
+  for (const p of await listPoints(type, `${f}.date >= "${start}" AND ${f}.date < "${end}"`, 1000)) {
+    const v = read(p), date = civilIso(Object.values(p).find(x => x?.date)?.date);
+    setField(date, key, v);
+  }
+};
+
+const ACTIVITY_LEVELS = { VIGOROUS: "veryActive", MODERATE: "fairlyActive", LIGHT: "lightlyActive" };
+
+const SYNC_JOBS = [
+  ["steps", async (start, end) => {
+    for (const p of await dailyRollUp("steps", start, end, 90)) setField(civilIso(p.civilStartTime?.date), "steps", num(p.steps?.countSum));
+  }],
+  ["active minutes", async (start, end) => {
+    for (const p of await dailyRollUp("active-minutes", start, end, 14)) {
+      const date = civilIso(p.civilStartTime?.date);
+      for (const lvl of p.activeMinutes?.activeMinutesRollupByActivityLevel ?? []) {
+        if (ACTIVITY_LEVELS[lvl.activityLevel]) setField(date, ACTIVITY_LEVELS[lvl.activityLevel], num(lvl.activeMinutesSum));
+      }
+    }
+  }],
+  ["resting heart rate", dailyJob("daily-resting-heart-rate", "rhr", p => num(p.dailyRestingHeartRate?.beatsPerMinute) || null)],
+  ["HRV", dailyJob("daily-heart-rate-variability", "hrv", p => num(p.dailyHeartRateVariability?.averageHeartRateVariabilityMilliseconds))],
+  ["blood oxygen", dailyJob("daily-oxygen-saturation", "spo2", p => num(p.dailyOxygenSaturation?.averagePercentage))],
+  ["sleep", async (start, end) => {
+    // Sleep only filters on end time; a night belongs to the day you woke up, like Fitbit's dateOfSleep.
+    const points = await listPoints("sleep", `sleep.interval.civil_end_time >= "${start}T00:00:00" AND sleep.interval.civil_end_time < "${end}T00:00:00"`, 25);
+    const best = new Map();
+    for (const p of points) {
+      const sl = p.sleep, date = civilIso(sl?.interval?.civilEndTime?.date);
+      if (!date) continue;
+      const asleep = num(sl.summary?.minutesAsleep) ?? 0, main = sl.metadata?.mainSleep === true;
+      const cur = best.get(date);
+      if (cur && !((main && !cur.main) || (main === cur.main && asleep > cur.asleep))) continue;
+      const st = {};
+      for (const x of sl.summary?.stagesSummary ?? []) st[x.type] = num(x.minutes);
+      best.set(date, { main, asleep, deep: st.DEEP ?? null, light: st.LIGHT ?? null, rem: st.REM ?? null, wake: st.AWAKE ?? null, efficiency: null });
+    }
+    for (const [date, v] of best) day(STORE, date).sleep = v;
+  }],
+  ["weight", async (start, end) => {
+    for (const p of await dailyRollUp("weight", start, end, 90)) {
+      const g = num(p.weight?.weightGramsAvg);
+      if (g) setField(civilIso(p.civilStartTime?.date), "weightKg", Math.round(g / 100) / 10);
+    }
+  }],
+];
+
+async function runSync() {
+  if (syncing) return;
+  syncing = true;
+  $("syncBtn").disabled = true;
+  const store = realStore();
+  const today = isoLocal(new Date()), end = addDays(today, 1);
+  // First sync pulls 90 days; later syncs re-pull a few days so late-arriving sleep and HRV fill in.
+  const start = store.lastSyncDate ? addDays(store.lastSyncDate, -3) : addDays(today, -89);
+  const failed = [];
+  let expired = false;
+  for (const [label, job] of SYNC_JOBS) {
+    setStatus(`Syncing ${label}…`);
+    try { await job(start, end); }
+    catch (e) {
+      if (e.status === 401) { expired = true; token = null; break; }
+      failed.push(`${label}: ${e.status === 403 ? "no permission (check scopes and test user)" : e.message}`);
+    }
+  }
+  syncing = false;
+  $("syncBtn").disabled = false;
+  if (expired) return setStatus("Your Google sign-in expired. Tap Sync from Fitbit again.");
+  if (failed.length < SYNC_JOBS.length) {
+    store.lastSyncDate = today;
+    store.lastSyncAt = new Date().toISOString();
+    saveStore();
+  }
+  if (store.days.size) render(false);
+  else { $("dash").classList.add("hidden"); $("demoBanner").classList.add("hidden"); }
+  setStatus(failed.length
+    ? `Synced with problems. ${failed.join("; ")}.`
+    : `Synced ${longDate(start)} to today, at ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.`);
+}
+
 // ---------- Rendering ----------
 
 let STORE = null, RANGE = 90;
@@ -447,6 +679,7 @@ function rolling(values, n) {
 
 // Chart definitions. Series colors are fixed by role so a range change never repaints them.
 function chartDefs() {
+  const hasKg = [...STORE.days.values()].some(d => d.weightKg != null);
   return [
     {
       id: "steps", title: "Steps", note: "Daily total, with 7-day average. Days with 0 steps (not worn) are left out of averages.",
@@ -470,7 +703,7 @@ function chartDefs() {
       ], fmt: fmtHm, extraCols: [["Asleep", d => fmtHm(d.sleep?.asleep)], ["Efficiency", d => d.sleep?.efficiency != null ? d.sleep.efficiency + "%" : "–"]],
     },
     {
-      id: "sleepScore", title: "Sleep score", note: "Fitbit's overall score (0–100), if your export includes it.",
+      id: "sleepScore", title: "Sleep score", note: "Fitbit's overall score (0–100). Takeout only: the Google Health API doesn't provide it.",
       series: [{ label: "Sleep score", type: "line", color: "--series-1", get: d => d.sleepScore ?? null }], fmt: fmtInt,
     },
     {
@@ -491,8 +724,13 @@ function chartDefs() {
       ], fmt: fmtInt, unit: " min",
     },
     {
-      id: "weight", title: "Weight", note: "Logged weights, in the unit your Fitbit account uses.",
-      series: [{ label: "Weight", type: "line", color: "--series-1", get: d => d.weight ?? null }], fmt: fmt1, spanGaps: true,
+      // Synced weight is in kg; Takeout weight is in the account's unit, so never mix the two.
+      ...(hasKg
+        ? { id: "weight", title: "Weight", note: "Logged weights, in kg (from sync).",
+            series: [{ label: "Weight", type: "line", color: "--series-1", get: d => d.weightKg ?? null }], unit: " kg" }
+        : { id: "weight", title: "Weight", note: "Logged weights, in the unit your Fitbit account uses.",
+            series: [{ label: "Weight", type: "line", color: "--series-1", get: d => d.weight ?? null }] }),
+      fmt: fmt1, spanGaps: true,
     },
   ];
 }
@@ -571,11 +809,12 @@ function renderCharts() {
 function renderAbout(isDemo) {
   const dates = sortedDates();
   const read = Object.values(STORE.counts).reduce((a, b) => a + b, 0);
-  $("aboutNote").textContent = isDemo
-    ? "Demo data is randomly generated so you can see the layout."
-    : `${read} files read, covering ${longDate(dates[0])} to ${longDate(dates[dates.length - 1])}. ` +
-      `${STORE.skipped} large minute-level file${STORE.skipped === 1 ? " was" : "s were"} skipped on purpose (heart rate, calories, distance) to keep this fast. ` +
-      "Premium-only analysis like Daily Readiness isn't recreated here; you're seeing the underlying measurements.";
+  const parts = [`Your data covers ${longDate(dates[0])} to ${longDate(dates[dates.length - 1])}.`];
+  if (STORE.lastSyncAt) parts.push(`Last synced ${new Date(STORE.lastSyncAt).toLocaleString()}.`);
+  if (read) parts.push(`${read} Takeout files read.`);
+  if (STORE.skipped) parts.push(`${STORE.skipped} large minute-level file${STORE.skipped === 1 ? " was" : "s were"} skipped on purpose (heart rate, calories, distance) to keep this fast.`);
+  parts.push("Premium-only analysis like Daily Readiness isn't recreated here; you're seeing the underlying measurements.");
+  $("aboutNote").textContent = isDemo ? "Demo data is randomly generated so you can see the layout." : parts.join(" ");
   $("unknownDetails").classList.toggle("hidden", !STORE.unknown.length);
   $("unknownList").innerHTML = "";
   for (const p of STORE.unknown.slice(0, 300)) {
@@ -599,14 +838,27 @@ function render(isDemo) {
 // ---------- Wiring ----------
 
 let IS_DEMO = false;
+
+// Real data store to add to: drops demo data, keeps anything already loaded or synced.
+function realStore() {
+  if (IS_DEMO || !STORE) { STORE = loadSaved() ?? newStore(); IS_DEMO = false; }
+  return STORE;
+}
+
 async function load(files) {
   if (!files.length) return;
   setStatus("Reading…");
   try {
-    STORE = await readFiles(files);
-    IS_DEMO = false;
+    const fresh = await readFiles(files);
+    const store = realStore();
+    for (const [date, d] of fresh.days) Object.assign(day(store, date), d);
+    for (const [k, n] of Object.entries(fresh.counts)) store.counts[k] = (store.counts[k] ?? 0) + n;
+    store.unknown = fresh.unknown;
+    store.skipped = fresh.skipped;
+    if (!fresh.days.size) { setStatus("Couldn't find Fitbit data in those files. Look for a folder named \"Fitbit\" in your Takeout export, or open the .zip directly."); return; }
+    saveStore();
     render(false);
-    if (STORE.days.size) setStatus(`Loaded ${STORE.days.size.toLocaleString()} days of data.`);
+    setStatus(`Loaded ${fresh.days.size.toLocaleString()} days from Takeout.`);
   } catch (e) {
     console.error(e);
     setStatus("Something went wrong reading the files: " + e.message);
@@ -614,6 +866,21 @@ async function load(files) {
 }
 
 $("fileInput").addEventListener("change", e => load(e.target.files));
+$("syncBtn").addEventListener("click", onSyncClick);
+$("clientId").value = getClientId();
+$("saveClientId").addEventListener("click", () => {
+  setClientId($("clientId").value.trim());
+  tokenClient = null; token = null;
+  if (getClientId()) { loadGis().then(initTokenClient).catch(e => setStatus(e.message)); setStatus("Client ID saved. Tap Sync from Fitbit."); }
+});
+$("forgetBtn").addEventListener("click", () => {
+  if (!confirm("Delete all synced and imported health data saved in this browser?")) return;
+  try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* storage unavailable */ }
+  if (token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(token.value, () => {});
+  token = null; STORE = null; IS_DEMO = false;
+  $("dash").classList.add("hidden"); $("demoBanner").classList.add("hidden");
+  setStatus("Saved data deleted from this browser.");
+});
 $("folderInput").addEventListener("change", e => load(e.target.files));
 $("demoBtn").addEventListener("click", () => {
   STORE = demoStore(); IS_DEMO = true; render(true);
@@ -630,6 +897,17 @@ $("rangeSeg").addEventListener("click", e => {
   if (STORE) renderCharts();
 });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (STORE) renderCharts(); });
+
+// Restore what was saved last time, and get Google sign-in ready so the
+// Sync tap can open its popup immediately (iOS blocks popups opened after an await).
+{
+  const saved = loadSaved();
+  if (saved?.days.size) {
+    STORE = saved; render(false);
+    setStatus(saved.lastSyncAt ? `Showing saved data. Last synced ${new Date(saved.lastSyncAt).toLocaleString()}.` : "Showing saved data.");
+  }
+  if (getClientId()) loadGis().then(initTokenClient).catch(() => {});
+}
 </script>
 </body>
 </html>
